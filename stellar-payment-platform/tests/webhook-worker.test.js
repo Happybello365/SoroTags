@@ -9,6 +9,12 @@ let mockWorkerProcessor;
 let mockWorkerOptions;
 
 jest.mock('bullmq', () => ({
+  UnrecoverableError: class UnrecoverableError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = 'UnrecoverableError';
+    }
+  },
   Queue: jest.fn().mockImplementation(() => ({
     add: mockQueueAdd,
     on: mockQueueOn,
@@ -28,7 +34,19 @@ jest.mock('../src/config/redis', () => ({
   createRedisConnection: jest.fn(() => ({ quit: mockRedisQuit })),
 }));
 
-const { Queue, Worker } = require('bullmq');
+const dns = require('dns');
+const { Queue, Worker, UnrecoverableError } = require('bullmq');
+
+const PUBLIC_IP = '93.184.216.34';
+let mockDnsLookup;
+beforeEach(() => {
+  mockDnsLookup = jest
+    .spyOn(dns.promises, 'lookup')
+    .mockResolvedValue([{ address: PUBLIC_IP, family: 4 }]);
+});
+afterEach(() => {
+  mockDnsLookup.mockRestore();
+});
 const {
   dispatchPaymentWebhooks,
   enqueueWebhookDelivery,
@@ -36,6 +54,9 @@ const {
   closeWebhookQueue,
   processWebhookJob,
   detectSsrfTarget,
+  assertSafeWebhookUrl,
+  classifyIpAddress,
+  SSRF_ERROR_CODE,
   MAX_WEBHOOK_ATTEMPTS,
   WEBHOOK_BACKOFF_DELAY_MS,
   WEBHOOK_QUEUE_NAME,
@@ -391,5 +412,238 @@ describe('SSRF protection – detectSsrfTarget', () => {
 
     await expect(sendWebhook('https://merchant.example.com/hook', { event: 'test' }, 'secret')).resolves.toEqual({ ok: true });
     expect(global.fetch).toHaveBeenCalledWith('https://merchant.example.com/hook', expect.anything());
+  });
+});
+
+describe('SSRF protection – extended address ranges', () => {
+  test.each([
+    ['https://0.0.0.0/hook', /reserved/i],
+    ['https://100.64.0.1/hook', /private/i], //        carrier-grade NAT
+    ['https://192.168.0.1:8443/hook', /private/i],
+    ['https://255.255.255.255/hook', /reserved/i],
+    ['https://224.0.0.1/hook', /multicast/i],
+    ['https://[fd12:3456::1]/hook', /private/i], //    IPv6 unique local
+    ['https://[fe80::1]/hook', /link-local/i],
+    ['https://[::]/hook', /reserved/i],
+    ['https://[::ffff:192.168.1.1]/hook', /private/i], // IPv4-mapped IPv6
+    ['https://[::ffff:127.0.0.1]/hook', /loopback/i],
+    ['https://2130706433/hook', /loopback/i], //        decimal 127.0.0.1
+    ['https://0x7f.0.0.1/hook', /loopback/i], //        hex 127.0.0.1
+    ['https://0300.0250.0.1/hook', /private/i], //      octal 192.168.0.1
+    ['https://api.localhost/hook', /loopback/i],
+  ])('blocks %s', (url, pattern) => {
+    expect(detectSsrfTarget(url)).toMatch(pattern);
+  });
+
+  test.each([
+    'gopher://merchant.example.com/_',
+    'data:text/plain,hello',
+    'javascript:alert(1)',
+    'ws://merchant.example.com/hook',
+  ])('blocks non-HTTPS scheme %s', (url) => {
+    expect(detectSsrfTarget(url)).toMatch(/HTTPS/);
+  });
+
+  test('blocks URLs with embedded credentials without echoing them', () => {
+    const message = detectSsrfTarget('https://user:s3cret@merchant.example.com/hook');
+    expect(message).toMatch(/credentials/i);
+    expect(message).not.toContain('s3cret');
+  });
+
+  test('blocks malformed URLs', () => {
+    expect(detectSsrfTarget('not a url')).toMatch(/not a valid URL/i);
+    expect(detectSsrfTarget('')).toMatch(/not a valid URL/i);
+  });
+
+  test.each([
+    'https://8.8.8.8/hook',
+    'https://[2606:4700:4700::1111]/hook',
+    'https://[::ffff:8.8.8.8]/hook',
+    'https://172.32.0.1/hook',
+  ])('allows public address %s', (url) => {
+    expect(detectSsrfTarget(url)).toBeNull();
+  });
+
+  test('classifyIpAddress labels ranges and rejects non-IP input', () => {
+    expect(classifyIpAddress('10.1.2.3')).toBe('private');
+    expect(classifyIpAddress('127.0.0.1')).toBe('loopback');
+    expect(classifyIpAddress('169.254.169.254')).toBe('link-local');
+    expect(classifyIpAddress('8.8.8.8')).toBeNull();
+    expect(classifyIpAddress('merchant.example.com')).toBe('invalid');
+  });
+});
+
+describe('SSRF protection – DNS resolution at delivery time', () => {
+  test('blocks a hostname that resolves to a private IP', async () => {
+    mockDnsLookup.mockResolvedValue([{ address: '192.168.1.10', family: 4 }]);
+
+    await expect(assertSafeWebhookUrl('https://internal.attacker.example/hook')).rejects.toMatchObject({
+      code: SSRF_ERROR_CODE,
+      message: expect.stringMatching(/private.*internal\.attacker\.example -> 192\.168\.1\.10/i),
+    });
+  });
+
+  test('blocks a hostname when any one of its addresses is private', async () => {
+    mockDnsLookup.mockResolvedValue([
+      { address: PUBLIC_IP, family: 4 },
+      { address: '10.0.0.5', family: 4 },
+    ]);
+
+    await expect(assertSafeWebhookUrl('https://mixed.example/hook')).rejects.toMatchObject({
+      code: SSRF_ERROR_CODE,
+    });
+  });
+
+  test('blocks a hostname that resolves to the cloud metadata address', async () => {
+    mockDnsLookup.mockResolvedValue([{ address: '169.254.169.254', family: 4 }]);
+
+    await expect(assertSafeWebhookUrl('https://metadata.example/latest')).rejects.toThrow(/link-local/i);
+  });
+
+  test('blocks a hostname that resolves to IPv6 loopback', async () => {
+    mockDnsLookup.mockResolvedValue([{ address: '::1', family: 6 }]);
+
+    await expect(assertSafeWebhookUrl('https://v6.example/hook')).rejects.toThrow(/loopback/i);
+  });
+
+  test('fails closed when the hostname cannot be resolved', async () => {
+    mockDnsLookup.mockRejectedValue(Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }));
+
+    await expect(assertSafeWebhookUrl('https://nowhere.example/hook')).rejects.toMatchObject({
+      code: SSRF_ERROR_CODE,
+      message: expect.stringMatching(/could not be resolved \(ENOTFOUND\)/),
+    });
+  });
+
+  test('fails closed when DNS returns no addresses', async () => {
+    mockDnsLookup.mockResolvedValue([]);
+
+    await expect(assertSafeWebhookUrl('https://empty.example/hook')).rejects.toThrow(/no addresses/i);
+  });
+
+  test('allows a hostname that resolves only to public IPs', async () => {
+    await expect(assertSafeWebhookUrl('https://merchant.example.com/hook')).resolves.toBeUndefined();
+    expect(mockDnsLookup).toHaveBeenCalledWith('merchant.example.com', expect.objectContaining({ all: true }));
+  });
+
+  test('does not resolve DNS for IP literals', async () => {
+    await expect(assertSafeWebhookUrl('https://8.8.8.8/hook')).resolves.toBeUndefined();
+    expect(mockDnsLookup).not.toHaveBeenCalled();
+  });
+
+  test('sendWebhook does not fetch when the hostname resolves to a private IP', async () => {
+    const { sendWebhook } = require('../src/webhookWorker');
+    mockDnsLookup.mockResolvedValue([{ address: '10.0.0.1', family: 4 }]);
+    global.fetch = jest.fn();
+
+    await expect(sendWebhook('https://rebind.example/hook', { event: 'test' }, 'secret'))
+      .rejects.toMatchObject({ code: SSRF_ERROR_CODE });
+    expect(global.fetch).not.toHaveBeenCalled();
+
+    delete global.fetch;
+  });
+
+  test('sendWebhook does not follow redirects', async () => {
+    const { sendWebhook } = require('../src/webhookWorker');
+    global.fetch = jest.fn().mockResolvedValue({ ok: true });
+
+    await sendWebhook('https://merchant.example.com/hook', { event: 'test' }, 'secret');
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://merchant.example.com/hook',
+      expect.objectContaining({ redirect: 'manual' }),
+    );
+
+    delete global.fetch;
+  });
+});
+
+describe('SSRF protection – worker job handling', () => {
+  const buildPrisma = () => ({
+    webhook: {
+      findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
+      update: jest.fn().mockResolvedValue({}),
+    },
+  });
+
+  beforeEach(() => {
+    global.fetch = jest.fn();
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+  });
+
+  test.each([
+    ['private IP', 'https://192.168.1.1/internal'],
+    ['plain http', 'http://merchant.example.com/hook'],
+    ['file scheme', 'file:///etc/passwd'],
+    ['loopback', 'https://127.0.0.1/admin'],
+  ])('fails a %s delivery permanently without retrying', async (_label, url) => {
+    const prisma = buildPrisma();
+
+    const result = processWebhookJob(
+      { data: { webhook: { ...webhook, url }, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    );
+
+    await expect(result).rejects.toBeInstanceOf(UnrecoverableError);
+    await expect(result).rejects.toMatchObject({ code: SSRF_ERROR_CODE });
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('records the failure on the webhook when the URL is rejected', async () => {
+    const prisma = buildPrisma();
+
+    await expect(processWebhookJob(
+      { data: { webhook: { ...webhook, url: 'https://10.0.0.1/hook' }, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toThrow(/SSRF blocked/);
+
+    expect(prisma.webhook.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: webhook.id },
+      data: expect.objectContaining({ failingSince: expect.any(Date) }),
+    }));
+  });
+
+  test('logs a clear warning naming the webhook and the reason', async () => {
+    const { logger } = require('../src/logger');
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+    const prisma = buildPrisma();
+
+    await expect(processWebhookJob(
+      { data: { webhook: { ...webhook, url: 'https://192.168.1.1/internal' }, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toThrow();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ webhookId: webhook.id, reason: expect.stringMatching(/private/i) }),
+      expect.stringContaining(`Delivery rejected for webhook ${webhook.id}`),
+    );
+    warnSpy.mockRestore();
+  });
+
+  test('a hostname resolving to a private IP is also failed permanently', async () => {
+    mockDnsLookup.mockResolvedValue([{ address: '172.16.5.4', family: 4 }]);
+    const prisma = buildPrisma();
+
+    await expect(processWebhookJob(
+      { data: { webhook: { ...webhook, url: 'https://sneaky.example/hook' }, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toBeInstanceOf(UnrecoverableError);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('ordinary HTTP failures are still retryable (not UnrecoverableError)', async () => {
+    global.fetch.mockResolvedValue({ ok: false, status: 503 });
+    const prisma = buildPrisma();
+
+    const result = processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    );
+
+    await expect(result).rejects.toThrow('HTTP 503');
+    await expect(result).rejects.not.toBeInstanceOf(UnrecoverableError);
   });
 });
