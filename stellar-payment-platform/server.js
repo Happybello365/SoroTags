@@ -165,10 +165,15 @@ const corsOptions = {
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Request-ID", "X-Api-Key"],
   credentials: true,
-  optionsSuccessStatus: 204,
+  // Browser preflights must get 200 OK; some clients treat 204 as a failure.
+  optionsSuccessStatus: 200,
 };
 
 app.use(cors(corsOptions));
+
+// Explicitly answer every OPTIONS preflight here, before any router or
+// app.all() method-not-allowed handler (e.g. under /admin/*) can return 405.
+app.options("*", cors(corsOptions));
 
 // Apply metrics middleware to track all HTTP requests
 app.use(metricsMiddleware);
