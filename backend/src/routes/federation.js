@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const router = express.Router();
 const { getFederationRecord } = require('../services/federation');
 
-const CACHE_CONTROL_SUCCESS = 'public, max-age=300, stale-while-revalidate=60';
+const CACHE_CONTROL_SUCCESS = 'public, max-age=60, stale-while-revalidate=30';
 const CACHE_CONTROL_NOT_FOUND = 'no-store';
 
 function computeETag(body) {

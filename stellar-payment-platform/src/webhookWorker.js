@@ -4,7 +4,12 @@ const net = require('net');
 const { Queue, Worker, UnrecoverableError } = require('bullmq');
 const { createRedisConnection } = require('./config/redis');
 const { logger } = require('./logger');
-const { shouldFallbackToLocalRegistry, exponentialDelay } = require('./utils');
+const { shouldFallbackToLocalRegistry } = require('./utils');
+const { decryptSecret } = require('./utils/webhookSecret');
+const {
+  shouldFallbackToLocalRegistry,
+  exponentialDelay,
+} = require('./utils');
 const {
   updatePaymentIntentStatus,
   VALID_TRANSITIONS,
@@ -327,6 +332,13 @@ const sendWebhook = async (url, payload, secret) => {
   // Hostnames are resolved and every address checked. Redirects are not
   // followed, so a 3xx cannot bounce the request to an internal target.
   await assertSafeWebhookUrl(url);
+  const ssrfError = detectSsrfTarget(url);
+  if (ssrfError) {
+    throw Object.assign(new Error(ssrfError), {
+      code: 'SSRF_BLOCKED',
+      retryable: false,
+    });
+  }
   // ── end SSRF guard ─────────────────────────────────────────────────────────
 
   const rawBody = JSON.stringify(payload);
@@ -355,7 +367,12 @@ const sendWebhook = async (url, payload, secret) => {
       redirect: 'manual',
     });
     if (!response.ok) {
-      throw new Error(`Webhook responded with HTTP ${response.status}`);
+      throw Object.assign(
+        new Error(`Webhook responded with HTTP ${response.status}`),
+        {
+          retryable: [429, 500, 502, 503, 504].includes(response.status),
+        },
+      );
     }
     return { ok: true };
   } finally {
@@ -432,13 +449,71 @@ const applyWebhookPaymentIntentStatus = async ({
   return updatePaymentIntentStatus(prisma, paymentIntentId, nextStatus, data);
 };
 
+const recordWebhookEventAttempt = async (prisma, webhook, payload) => {
+  const serializedPayload = JSON.stringify(payload);
+  let event = await prisma.webhookEvent.findFirst({
+    where: {
+      eventType: payload.event,
+      payload: serializedPayload,
+      merchantId: webhook.id,
+    },
+    select: { id: true },
+  });
+
+  if (!event) {
+    event = await prisma.webhookEvent.create({
+      data: {
+        eventType: payload.event,
+        payload: serializedPayload,
+        merchantId: webhook.id,
+      },
+      select: { id: true },
+    });
+  }
+
+  await prisma.webhookEvent.update({
+    where: { id: event.id },
+    data: {
+      attemptCount: { increment: 1 },
+      status: 'pending',
+      lastError: null,
+      deliveredAt: null,
+    },
+  });
+
+  return event.id;
+};
+
+const markWebhookEventDeadLetter = async (prisma, webhook, payload, error) => {
+  const event = await prisma.webhookEvent.findFirst({
+    where: {
+      eventType: payload.event,
+      payload: JSON.stringify(payload),
+      merchantId: webhook.id,
+    },
+    select: { id: true },
+  });
+
+  if (event) {
+    await prisma.webhookEvent.update({
+      where: { id: event.id },
+      data: { status: 'dead_letter', lastError: error.message },
+    });
+  }
+};
+
 const processWebhookJob = async (job, { prisma, poolRunFn }) => {
   const { webhook, payload } = job.data;
   const now = new Date();
+  const webhookEventId = await recordWebhookEventAttempt(prisma, webhook, payload);
 
   try {
     await sendWebhook(webhook.url, payload, webhook.secret);
   } catch (error) {
+    await prisma.webhookEvent.update({
+      where: { id: webhookEventId },
+      data: { lastError: error.message },
+    });
     try {
       await markWebhookFailure(prisma, poolRunFn, webhook.id, now);
     } catch (databaseError) {
@@ -460,6 +535,11 @@ const processWebhookJob = async (job, { prisma, poolRunFn }) => {
     }
     throw error;
   }
+
+  await prisma.webhookEvent.update({
+    where: { id: webhookEventId },
+    data: { status: 'delivered', lastError: null, deliveredAt: now },
+  });
 
   try {
     await markWebhookSuccess(prisma, poolRunFn, webhook.id, now);
@@ -499,6 +579,9 @@ const processWebhookJob = async (job, { prisma, poolRunFn }) => {
 const getWebhookQueue = () => {
   if (!webhookQueue) {
     queueConnection = createRedisConnection();
+    if (!queueConnection) {
+      throw new Error('Redis is not configured (REDIS_URL is unset). Cannot create webhook queue.');
+    }
     webhookQueue = new Queue(WEBHOOK_QUEUE_NAME, { connection: queueConnection });
     webhookQueue.on('error', (error) => {
       logger.error(`[webhook-queue] Redis error: ${error.message}`);
@@ -511,25 +594,45 @@ const startWebhookWorker = ({ prisma, poolRunFn }) => {
   if (webhookWorker) return webhookWorker;
 
   workerConnection = createRedisConnection();
+  if (!workerConnection) {
+    throw new Error('Redis is not configured (REDIS_URL is unset). Cannot start webhook worker.');
+  }
   webhookWorker = new Worker(
     WEBHOOK_QUEUE_NAME,
     (job) => processWebhookJob(job, { prisma, poolRunFn }),
     {
       connection: workerConnection,
       concurrency: WEBHOOK_WORKER_CONCURRENCY,
+      settings: {
+        backoffStrategy: (attemptsMade, _type, error) =>
+          error?.retryable === false ? -1 : computeRetryDelay(attemptsMade),
+      },
     },
   );
 
   webhookWorker.on('failed', async (job, error) => {
     const maxAttempts = job?.opts?.attempts || MAX_WEBHOOK_ATTEMPTS;
-    const attemptsMade = job?.attemptsMade || 1;
+    const attemptsMade = job?.attemptsMade ?? 1;
 
-    if (attemptsMade >= maxAttempts && job?.data?.webhook) {
+    if (
+      (attemptsMade >= maxAttempts || error?.retryable === false) &&
+      job?.data?.webhook
+    ) {
       logger.error(`[webhook-worker] Delivery failed job=${job?.id || 'unknown'}: ${error.message}; retries exhausted (${attemptsMade}/${maxAttempts})`);
       try {
-        await moveToDLQ(prisma, poolRunFn, job.data.webhook);
+        await moveToDLQ(prisma, poolRunFn, job.data.webhook, error);
       } catch (dlqErr) {
         logger.error(`[webhook-worker] Failed to move webhook ${job.data.webhook.id} to DLQ: ${dlqErr.message}`);
+      }
+      try {
+        await markWebhookEventDeadLetter(
+          prisma,
+          job.data.webhook,
+          job.data.payload,
+          error,
+        );
+      } catch (eventErr) {
+        logger.error(`[webhook-worker] Failed to mark event dead letter for job=${job?.id || 'unknown'}: ${eventErr.message}`);
       }
     } else {
       const nextDelayMs = computeRetryDelay(attemptsMade + 1);
@@ -633,7 +736,7 @@ const closeWebhookQueue = async () => {
  * The webhook row itself is left intact so the user can re-register if needed;
  * only the delivery record is preserved for manual replay.
  */
-const moveToDLQ = async (prisma, poolRunFn, webhook) => {
+const moveToDLQ = async (prisma, poolRunFn, webhook, lastError = null) => {
   const payload = {
     event: 'webhook.delivery_failed',
     event_id: `dlq-${webhook.id}-${crypto.randomBytes(8).toString('hex')}`,
@@ -690,9 +793,41 @@ const moveToDLQ = async (prisma, poolRunFn, webhook) => {
   // The webhook stays registered; a new payment will retry fresh.
   await markWebhookSuccess(prisma, poolRunFn, webhook.id, now);
 
-  logger.info(
-    `[webhook-worker] Moved to DLQ: webhookId=${webhook.id} username=${webhook.username} url=${webhook.url}`,
-  );
+  const lastError = lastError && lastError.message ? lastError.message : (lastError ? String(lastError) : null);
+
+  // Emit a structured warning so operators can alert on DLQ transitions
+  // without polling the DLQ API.
+  logger.warn('Webhook moved to DLQ', {
+    webhookId: webhook.id,
+    eventId: payload.event_id,
+    username: webhook.username,
+    url: webhook.url,
+    lastError,
+  });
+
+  // Optionally notify an external operator endpoint when configured. Failures
+  // here must never prevent the DLQ write from succeeding, so they are
+  // swallowed and logged.
+  const notifyUrl = process.env.WEBHOOK_DLQ_NOTIFY_URL;
+  if (notifyUrl && typeof fetch === 'function') {
+    try {
+      await fetch(notifyUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'webhook.dlq',
+          webhookId: webhook.id,
+          eventId: payload.event_id,
+          username: webhook.username,
+          url: webhook.url,
+          lastError,
+          movedAt: now.toISOString(),
+        }),
+      });
+    } catch (notifyErr) {
+      logger.error(`[webhook-worker] Failed to POST DLQ notification: ${notifyErr.message}`);
+    }
+  }
 };
 
 /**
