@@ -796,5 +796,7 @@ See [LICENSE](LICENSE).
 <!-- handsoff-issue-250 -->
 - #250: [#83] Smart contract `route_batch` does not return per-recipient result status
 
+<!-- handsoff-issue-69 -->
+- #69: CI `soroban.yml` workflow does not run contract unit tests
 <!-- handsoff-issue-35 -->
 - #35: `docker-compose.yml` `test` profile exposes database port 5433 without authentication
